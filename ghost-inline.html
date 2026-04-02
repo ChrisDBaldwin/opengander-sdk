@@ -1,0 +1,1256 @@
+<!-- OpenGander Browser SDK - Inline Version for Ghost -->
+<!-- Copy this entire snippet into Ghost Admin → Settings → Code Injection → Site Header -->
+<!-- Includes consent module — no additional scripts needed -->
+
+<script>
+/**
+ * OpenGander Browser SDK (inline for Ghost)
+ *
+ * Real User Monitoring (RUM) with built-in privacy consent.
+ * Consent is bundled — visitors see a banner/gate before any tracking.
+ */
+
+(function() {
+  'use strict';
+
+  // Configuration defaults
+  const DEFAULT_CONFIG = {
+    serviceName: window.location.hostname,
+    collectorUrl: null, // REQUIRED — set to your OpenGander collector URL (e.g. 'https://collect.opengander.com/v1/traces')
+    tokenEndpoint: '/api/telemetry-token', // Endpoint to fetch short-lived JWT tokens
+    debug: false,
+    sampleRate: 1.0, // 100% sampling by default
+    captureConsole: false,
+    captureInteractions: true,
+    captureWebVitals: true,
+    captureErrors: true,
+    customAttributes: {},
+    requireToken: false, // Fail initialization if token fetch fails
+    maxQueueSize: 100    // Maximum queued events before dropping
+  };
+
+  let config = { ...DEFAULT_CONFIG };
+  let tracer;
+  let provider;
+
+  // SDK ready state tracking
+  let sdkReady = false;
+  let eventQueue = [];
+  const MAX_QUEUE_SIZE = 100; // Prevent memory leaks
+
+  // Token cache for short-lived JWT tokens
+  // Structure: { token: string, expiresAt: number }
+  let tokenCache = null;
+  let tokenFetchPromise = null; // Prevent concurrent token fetches
+
+  // Session sequence counter — monotonically increasing step number within session
+  let sessionSequence = 0;
+
+  /**
+   * Fetch a new telemetry token from the token endpoint
+   * Implements retry logic and prevents concurrent fetches
+   *
+   * Returns: Promise<string> - The JWT token
+   */
+  async function fetchTelemetryToken() {
+    // If a fetch is already in progress, wait for it
+    if (tokenFetchPromise) {
+      return tokenFetchPromise;
+    }
+
+    // Create new fetch promise
+    tokenFetchPromise = (async () => {
+      try {
+        const endpoint = config.tokenEndpoint || '/api/telemetry-token';
+        const response = await fetch(endpoint, {
+          method: 'GET',
+          credentials: 'same-origin', // Include cookies if needed
+          headers: {
+            'Accept': 'application/json'
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error(`Token fetch failed: ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        if (!data.token) {
+          throw new Error('Token response missing token field');
+        }
+
+        // Calculate expiry time (subtract 30 seconds for safety margin)
+        const expiresIn = data.expiresIn || 300; // Default 5 minutes
+        const expiresAt = Date.now() + (expiresIn * 1000) - 30000; // 30s safety margin
+
+        // Cache the token
+        tokenCache = {
+          token: data.token,
+          expiresAt: expiresAt
+        };
+
+        if (config.debug) {
+          console.log('[OTEL] Token fetched, expires in', expiresIn, 'seconds');
+        }
+
+        return data.token;
+      } catch (error) {
+        if (config.debug) {
+          console.error('[OTEL] Token fetch failed:', error);
+        }
+        throw error;
+      } finally {
+        tokenFetchPromise = null;
+      }
+    })();
+
+    return tokenFetchPromise;
+  }
+
+  /**
+   * Get a valid telemetry token, fetching a new one if needed
+   * Checks cache first, refreshes if expired or about to expire
+   * Falls back to static apiKey if token fetching fails
+   *
+   * Returns: Promise<string> - The authentication token
+   */
+  async function getTelemetryToken() {
+    // If static API key is provided, use it (backward compatibility)
+    if (config.apiKey) {
+      return config.apiKey;
+    }
+
+    // If no token endpoint configured, return null (no auth)
+    if (!config.tokenEndpoint) {
+      return null;
+    }
+
+    // Check if cached token is still valid (with 30 second safety margin)
+    const now = Date.now();
+    if (tokenCache && tokenCache.expiresAt > now) {
+      return tokenCache.token;
+    }
+
+    // Token expired or missing, fetch new one
+    try {
+      return await fetchTelemetryToken();
+    } catch (error) {
+      // If token fetch fails, log error but don't block telemetry sending
+      // The server will reject unauthorized requests
+      if (config.debug) {
+        console.warn('[OTEL] Using expired/invalid token due to fetch failure:', error);
+      }
+
+      // Return cached token if available (even if expired) as last resort
+      // Server will reject it, but at least we tried
+      return tokenCache ? tokenCache.token : null;
+    }
+  }
+
+  /**
+   * Initialize OpenTelemetry Browser SDK
+   */
+  async function initOtelBrowser(userConfig = {}) {
+    config = { ...DEFAULT_CONFIG, ...userConfig };
+
+    if (config.debug) {
+      console.log('[OTEL] Initializing with config:', config);
+    }
+
+    // Fetch token BEFORE marking SDK as ready
+    if (config.tokenEndpoint && !config.apiKey) {
+      try {
+        if (config.debug) {
+          console.log('[OTEL] Fetching initial token...');
+        }
+        await fetchTelemetryToken();
+        if (config.debug) {
+          console.log('[OTEL] Initial token fetched successfully');
+        }
+      } catch (err) {
+        console.error('[OTEL] Initial token fetch failed:', err);
+
+        // Decide: fail fast or degrade gracefully?
+        if (config.requireToken) {
+          // Fail fast mode: don't initialize if token fetch fails
+          console.error('[OTEL] SDK initialization failed (requireToken=true)');
+          return;
+        }
+
+        // Graceful degradation: continue without token (telemetry will be rejected)
+        console.warn('[OTEL] Continuing without token (telemetry may fail)');
+      }
+    }
+
+    // Send telemetry using fetch with authentication
+    const sendTelemetry = async (endpoint, data) => {
+      const url = `${config.collectorUrl.replace('/v1/traces', '')}${endpoint}`;
+      const payload = JSON.stringify(data);
+
+      // Build headers
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+
+      // Get authentication token (JWT token or static API key)
+      try {
+        const authToken = await getTelemetryToken();
+        if (authToken) {
+          headers['Authorization'] = `Bearer ${authToken}`;
+        }
+      } catch (error) {
+        if (config.debug) {
+          console.error('[OTEL] Failed to get auth token:', error);
+        }
+        // Continue without auth - server will reject if required
+      }
+
+      // Use fetch with keepalive for reliability (sendBeacon doesn't support custom headers)
+      fetch(url, {
+        method: 'POST',
+        headers: headers,
+        body: payload,
+        keepalive: true
+      }).catch(err => {
+        if (config.debug) console.error('[OTEL] Send failed:', err);
+      });
+    };
+
+    // Helper functions for marketing attributes
+    function parseContentFromUrl(pathname) {
+      const parts = pathname.split('/').filter(Boolean);
+      const section = parts[0] || 'home';
+
+      let type = 'page';
+      if (pathname === '/') type = 'landing_page';
+      else if (pathname === '/resume') type = 'resume';
+      else if (pathname === '/cv') type = 'cv';
+      else if (pathname.startsWith('/musings/') || pathname.startsWith('/blog/')) type = 'blog_post';
+      else if (pathname.startsWith('/about')) type = 'about_page';
+
+      return { slug: pathname, section, type };
+    }
+
+    function parseUtmParams() {
+      const params = new URLSearchParams(window.location.search);
+      return {
+        source: params.get('utm_source') || null,
+        medium: params.get('utm_medium') || null,
+        campaign: params.get('utm_campaign') || null,
+        term: params.get('utm_term') || null,
+        content: params.get('utm_content') || null
+      };
+    }
+
+    function isSearchEngine(domain) {
+      if (!domain) return false;
+      const searchEngines = [
+        'google', 'bing', 'yahoo', 'duckduckgo', 'baidu', 'yandex', 'ask',
+        'chatgpt', 'openai',  // ChatGPT and OpenAI
+        'perplexity',         // Perplexity AI
+        'you.com', 'you',     // You.com search
+        'brave',              // Brave Search
+        'ecosia'              // Ecosia
+      ];
+      return searchEngines.some(engine => domain.includes(engine));
+    }
+
+    function isSocialNetwork(domain) {
+      if (!domain) return false;
+      const socialNetworks = ['facebook', 'instagram', 'twitter', 'x.com', 'linkedin', 'pinterest',
+                             'reddit', 'tiktok', 'youtube', 'snapchat', 'whatsapp', 'telegram'];
+      return socialNetworks.some(social => domain.includes(social));
+    }
+
+    function determineChannel(source, medium, referrerDomain) {
+      const mediumLower = (medium || '').toLowerCase();
+      const sourceLower = (source || '').toLowerCase();
+
+      if ((mediumLower.includes('cpc') || mediumLower.includes('ppc') || mediumLower === 'paid') &&
+          isSearchEngine(sourceLower)) {
+        return 'Paid Search';
+      }
+      if (mediumLower === 'organic' || isSearchEngine(sourceLower) || isSearchEngine(referrerDomain)) {
+        return 'Organic Search';
+      }
+      if ((mediumLower.includes('social') || mediumLower.includes('cpc') || mediumLower.includes('paid')) &&
+          isSocialNetwork(sourceLower)) {
+        return 'Paid Social';
+      }
+      if (mediumLower === 'social' || isSocialNetwork(sourceLower) || isSocialNetwork(referrerDomain)) {
+        return 'Organic Social';
+      }
+      if (mediumLower === 'email' || mediumLower === 'e-mail') {
+        return 'Email';
+      }
+      if (mediumLower === 'referral' || referrerDomain) {
+        return 'Referral';
+      }
+      if (mediumLower.includes('display') || mediumLower.includes('banner') || mediumLower.includes('cpm')) {
+        return 'Display';
+      }
+      if (mediumLower === 'none' || mediumLower === '(none)' || !medium) {
+        return 'Direct';
+      }
+      return 'Other';
+    }
+
+    function parseTrafficSource() {
+      const utm = parseUtmParams();
+      const referrer = document.referrer;
+      let referrerDomain = null;
+
+      try {
+        if (referrer) {
+          referrerDomain = new URL(referrer).hostname;
+        }
+      } catch (e) {}
+
+      if (utm.source || utm.medium) {
+        const channel = determineChannel(utm.source, utm.medium, referrerDomain);
+        return {
+          source: utm.source || referrerDomain || 'direct',
+          medium: utm.medium || 'none',
+          campaign: utm.campaign,
+          term: utm.term,
+          content: utm.content,
+          channel: channel
+        };
+      }
+
+      if (referrer && referrerDomain && referrerDomain !== window.location.hostname) {
+        let medium = 'referral';
+        let channel = 'Referral';
+        if (isSearchEngine(referrerDomain)) {
+          medium = 'organic';
+          channel = 'Organic Search';
+        } else if (isSocialNetwork(referrerDomain)) {
+          medium = 'social';
+          channel = 'Organic Social';
+        }
+        return {
+          source: referrerDomain,
+          medium: medium,
+          campaign: null,
+          term: null,
+          content: null,
+          channel: channel
+        };
+      }
+
+      return {
+        source: 'direct',
+        medium: 'none',
+        campaign: null,
+        term: null,
+        content: null,
+        channel: 'Direct'
+      };
+    }
+
+    function detectDevice() {
+      const ua = navigator.userAgent;
+      const viewport = {
+        width: window.innerWidth,
+        height: window.innerHeight
+      };
+
+      let category = 'desktop';
+      if (viewport.width < 768) {
+        category = 'mobile';
+      } else if (viewport.width < 1024) {
+        category = 'tablet';
+      }
+
+      let os = 'Unknown';
+      if (/Windows/i.test(ua)) os = 'Windows';
+      else if (/Macintosh|MacIntel|MacPPC|Mac68K/i.test(ua)) os = 'macOS';
+      else if (/iPhone|iPad|iPod/i.test(ua)) {
+        os = 'iOS';
+        category = /iPad/i.test(ua) ? 'tablet' : 'mobile';
+      }
+      else if (/Android/i.test(ua)) {
+        os = 'Android';
+        if (/tablet/i.test(ua)) category = 'tablet';
+      }
+      else if (/Linux/i.test(ua)) os = 'Linux';
+
+      let browser = 'Unknown';
+      if (/Edg\//i.test(ua)) browser = 'Edge';
+      else if (/Chrome/i.test(ua) && !/Edg/i.test(ua)) browser = 'Chrome';
+      else if (/Safari/i.test(ua) && !/Chrome/i.test(ua)) browser = 'Safari';
+      else if (/Firefox/i.test(ua)) browser = 'Firefox';
+      else if (/MSIE|Trident/i.test(ua)) browser = 'Internet Explorer';
+
+      return { category, os, browser };
+    }
+
+    function initUserSession() {
+      const STORAGE_KEY_USER = 'otel_user_id';
+      const STORAGE_KEY_FIRST_SEEN = 'otel_user_first_seen';
+      const STORAGE_KEY_VISIT_COUNT = 'otel_user_visit_count';
+      const STORAGE_KEY_SESSION = 'otel_session_id';
+      const STORAGE_KEY_SESSION_START = 'otel_session_start';
+      const STORAGE_KEY_SESSION_TRACE = 'otel_session_trace_id';
+      const STORAGE_KEY_TRAFFIC_SOURCE = 'otel_traffic_source';
+      const STORAGE_KEY_TRAFFIC_MEDIUM = 'otel_traffic_medium';
+      const STORAGE_KEY_TRAFFIC_CHANNEL = 'otel_traffic_channel';
+      const STORAGE_KEY_TRAFFIC_CAMPAIGN = 'otel_traffic_campaign';
+      const STORAGE_KEY_TRAFFIC_TERM = 'otel_traffic_term';
+      const STORAGE_KEY_TRAFFIC_CONTENT = 'otel_traffic_content';
+      const STORAGE_KEY_SESSION_SEQUENCE = 'otel_session_sequence';
+      const SESSION_TIMEOUT = 30 * 60 * 1000;
+
+      let userId = localStorage.getItem(STORAGE_KEY_USER);
+      let firstSeen = localStorage.getItem(STORAGE_KEY_FIRST_SEEN);
+      let visitCount = parseInt(localStorage.getItem(STORAGE_KEY_VISIT_COUNT) || '0', 10);
+
+      if (!userId) {
+        userId = generateTraceId();
+        localStorage.setItem(STORAGE_KEY_USER, userId);
+        firstSeen = new Date().toISOString();
+        localStorage.setItem(STORAGE_KEY_FIRST_SEEN, firstSeen);
+      }
+
+      const lastSessionStart = parseInt(localStorage.getItem(STORAGE_KEY_SESSION_START) || '0', 10);
+      const now = Date.now();
+      const isNewSession = (now - lastSessionStart) > SESSION_TIMEOUT;
+
+      // Capture or reuse traffic source
+      let trafficSource = null;
+
+      if (isNewSession) {
+        visitCount++;
+        localStorage.setItem(STORAGE_KEY_VISIT_COUNT, visitCount.toString());
+
+        // Reset session sequence for new session
+        sessionSequence = 0;
+        localStorage.setItem(STORAGE_KEY_SESSION_SEQUENCE, '0');
+
+        // Capture traffic source for new session
+        const traffic = parseTrafficSource(); // Call existing function
+        localStorage.setItem(STORAGE_KEY_TRAFFIC_SOURCE, traffic.source);
+        localStorage.setItem(STORAGE_KEY_TRAFFIC_MEDIUM, traffic.medium);
+        localStorage.setItem(STORAGE_KEY_TRAFFIC_CHANNEL, traffic.channel);
+        localStorage.setItem(STORAGE_KEY_TRAFFIC_CAMPAIGN, traffic.campaign || '');
+        localStorage.setItem(STORAGE_KEY_TRAFFIC_TERM, traffic.term || '');
+        localStorage.setItem(STORAGE_KEY_TRAFFIC_CONTENT, traffic.content || '');
+
+        trafficSource = traffic;
+      } else {
+        // Load session sequence from localStorage
+        sessionSequence = parseInt(localStorage.getItem(STORAGE_KEY_SESSION_SEQUENCE) || '0', 10);
+
+        // Reuse traffic source from localStorage
+        trafficSource = {
+          source: localStorage.getItem(STORAGE_KEY_TRAFFIC_SOURCE) || 'direct',
+          medium: localStorage.getItem(STORAGE_KEY_TRAFFIC_MEDIUM) || 'none',
+          channel: localStorage.getItem(STORAGE_KEY_TRAFFIC_CHANNEL) || 'Direct',
+          campaign: localStorage.getItem(STORAGE_KEY_TRAFFIC_CAMPAIGN) || null,
+          term: localStorage.getItem(STORAGE_KEY_TRAFFIC_TERM) || null,
+          content: localStorage.getItem(STORAGE_KEY_TRAFFIC_CONTENT) || null
+        };
+      }
+
+      let sessionId = localStorage.getItem(STORAGE_KEY_SESSION);
+      let sessionTraceId = localStorage.getItem(STORAGE_KEY_SESSION_TRACE);
+      if (isNewSession || !sessionId) {
+        sessionId = generateTraceId();
+        sessionTraceId = generateTraceId(); // One traceId per session
+        localStorage.setItem(STORAGE_KEY_SESSION, sessionId);
+        localStorage.setItem(STORAGE_KEY_SESSION_TRACE, sessionTraceId);
+      }
+      localStorage.setItem(STORAGE_KEY_SESSION_START, now.toString());
+
+      return {
+        userId,
+        firstSeen,
+        visitCount,
+        sessionId,
+        sessionTraceId,
+        isNewSession,
+        newVsReturning: visitCount === 1 ? 'new' : 'returning',
+        trafficSource  // Session-level traffic source (captured once per session)
+      };
+    }
+
+    function getSessionEntryPage() {
+      const STORAGE_KEY_ENTRY = 'otel_session_entry_page';
+      const STORAGE_KEY_ENTRY_TIME = 'otel_session_entry_time';
+      const SESSION_TIMEOUT = 30 * 60 * 1000;
+
+      const entryTime = parseInt(localStorage.getItem(STORAGE_KEY_ENTRY_TIME) || '0', 10);
+      const now = Date.now();
+
+      if ((now - entryTime) > SESSION_TIMEOUT || !localStorage.getItem(STORAGE_KEY_ENTRY)) {
+        const entryPage = window.location.pathname;
+        localStorage.setItem(STORAGE_KEY_ENTRY, entryPage);
+        localStorage.setItem(STORAGE_KEY_ENTRY_TIME, now.toString());
+        return entryPage;
+      }
+
+      return localStorage.getItem(STORAGE_KEY_ENTRY);
+    }
+
+    function getBaseMarketingAttributes() {
+      const content = parseContentFromUrl(window.location.pathname);
+
+      // User & session (initialize first to get cached traffic source)
+      const user = initUserSession();
+      const entryPage = getSessionEntryPage();
+      const entryContent = parseContentFromUrl(entryPage);
+
+      // Traffic source (use cached value from session)
+      const traffic = user.trafficSource;
+
+      // Device
+      const device = detectDevice();
+
+      const attrs = {
+        'content.slug': content.slug,
+        'content.section': content.section,
+        'content.type': content.type,
+        'traffic.source': traffic.source,
+        'traffic.medium': traffic.medium,
+        'traffic.channel': traffic.channel,
+        'device.category': device.category,
+        'device.os': device.os,
+        'device.browser': device.browser,
+        'user.id': user.userId,
+        'user.first_seen': user.firstSeen,
+        'user.visit_count': user.visitCount,
+        'user.new_vs_returning': user.newVsReturning,
+        'session.id': user.sessionId,
+        'session.index': user.visitCount,
+        'session.entry_page': entryPage,
+        'session.entry_content_type': entryContent.type,
+        'session.sequence': sessionSequence,
+        'session.timeout_ms': 30 * 60 * 1000,
+
+        // Consent (per session-spans-design spec)
+        'consent.status': 'granted',
+        'consent.jurisdiction': 'STANDARD',
+        'consent.ring': 'traffic',
+        'consent.version': '1',
+        'consent.protocol': 'unilateral'
+      };
+
+      if (traffic.campaign) attrs['traffic.campaign'] = traffic.campaign;
+      if (traffic.term) attrs['traffic.term'] = traffic.term;
+      if (traffic.content) attrs['traffic.content'] = traffic.content;
+
+      return attrs;
+    }
+
+    // Active span context for tracking parent-child relationships
+    let activeSpanContext = {
+      sessionTraceId: null,    // Session-level trace ID (shared across all spans in session)
+      activePageViewSpanId: null  // Current page view span ID (parent for page events)
+    };
+
+    // Initialize session trace ID
+    const userSession = initUserSession();
+    activeSpanContext.sessionTraceId = userSession.sessionTraceId;
+
+    // Simple span creation helper
+    const createSpan = (name, attributes = {}, parentSpanId = null) => {
+      const marketingAttrs = getBaseMarketingAttributes();
+
+      const span = {
+        traceId: activeSpanContext.sessionTraceId, // Use session-level trace ID
+        spanId: generateSpanId(),
+        parentSpanId: parentSpanId,  // Set parent span ID (null for root spans)
+        name,
+        timestamp: Date.now() * 1000000, // nanoseconds
+        duration: 0,
+        attributes: {
+          'service.name': config.serviceName,
+          'telemetry.sdk.name': 'opentelemetry-js-browser',
+          'telemetry.sdk.language': 'javascript',
+          'telemetry.sdk.version': '1.0.0',
+          ...marketingAttrs,
+          ...config.customAttributes,
+          ...attributes
+        }
+      };
+      return span;
+    };
+
+    const sendSpan = async (span) => {
+      // If SDK not ready, queue the event
+      if (!sdkReady) {
+        const maxQueue = config.maxQueueSize || 100;
+        if (eventQueue.length < maxQueue) {
+          eventQueue.push(span);
+          if (config.debug) {
+            console.log('[OTEL] SDK not ready, queued event:', span.name);
+          }
+        } else {
+          console.warn('[OTEL] Event queue full, dropping event:', span.name);
+        }
+        return;
+      }
+
+      if (Math.random() > config.sampleRate) return; // Sampling
+
+      // Build OTLP span structure with optional parentSpanId
+      const otlpSpan = {
+        traceId: span.traceId,
+        spanId: span.spanId,
+        name: span.name,
+        kind: 1, // SPAN_KIND_INTERNAL
+        startTimeUnixNano: String(span.timestamp),
+        endTimeUnixNano: String(span.timestamp + span.duration),
+        attributes: Object.entries(span.attributes).map(([key, value]) => ({
+          key,
+          value: { stringValue: String(value) }
+        }))
+      };
+
+      // Only include parentSpanId if it exists (root spans have no parent)
+      if (span.parentSpanId) {
+        otlpSpan.parentSpanId = span.parentSpanId;
+      }
+
+      const trace = {
+        resourceSpans: [{
+          resource: {
+            attributes: [
+              { key: 'service.name', value: { stringValue: config.serviceName } },
+              { key: 'deployment.environment', value: { stringValue: 'production' } }
+            ]
+          },
+          scopeSpans: [{
+            scope: { name: 'browser-instrumentation' },
+            spans: [otlpSpan]
+          }]
+        }]
+      };
+
+      // sendTelemetry is now async, but we don't need to await it
+      // Fire and forget - errors are handled internally
+      sendTelemetry('/v1/traces', trace);
+    };
+
+    // Flush queued events when SDK becomes ready
+    const flushEventQueue = () => {
+      const queue = [...eventQueue]; // Copy to prevent mutation during iteration
+      eventQueue.length = 0; // Clear queue
+
+      queue.forEach(span => {
+        // Don't re-queue events during flush
+        const originalReady = sdkReady;
+        sdkReady = true;
+        sendSpan(span);
+        sdkReady = originalReady;
+      });
+    };
+
+    // Track page view
+    const trackPageView = () => {
+      // Increment session sequence (1-based: first page_view in session = 1)
+      sessionSequence++;
+      try { localStorage.setItem('otel_session_sequence', sessionSequence.toString()); } catch (e) {}
+
+      const span = createSpan('page_view', {
+        // Event classification
+        'event.name': 'page_view',
+        'event.category': 'navigation',
+
+        // Page attributes
+        'http.url': window.location.href,
+        'http.target': window.location.pathname,
+        'http.host': window.location.hostname,
+        'http.scheme': window.location.protocol.replace(':', ''),
+        'user_agent.original': navigator.userAgent,
+        'page.referrer': document.referrer || 'direct',
+        'page.title': document.title,
+        'screen.width': window.screen.width,
+        'screen.height': window.screen.height,
+        'viewport.width': window.innerWidth,
+        'viewport.height': window.innerHeight
+      }, null); // page_view is a root span (no parent)
+
+      span.duration = 0;
+
+      // Set this page view as the active parent for subsequent events
+      activeSpanContext.activePageViewSpanId = span.spanId;
+
+      sendSpan(span);
+
+      if (config.debug) console.log('[OTEL] Page view tracked:', span);
+    };
+
+    // Track Web Vitals
+    if (config.captureWebVitals) {
+      // Largest Contentful Paint (LCP)
+      const observeLCP = new PerformanceObserver((list) => {
+        const entries = list.getEntries();
+        const lastEntry = entries[entries.length - 1];
+        const span = createSpan('web.vital.lcp', {
+          'web.vital.name': 'LCP',
+          'web.vital.value': lastEntry.renderTime || lastEntry.loadTime,
+          'web.vital.rating': lastEntry.renderTime < 2500 ? 'good' : lastEntry.renderTime < 4000 ? 'needs-improvement' : 'poor',
+          'web.vital.element': lastEntry.element?.tagName || 'unknown'
+        }, activeSpanContext.activePageViewSpanId); // Child of page_view
+        span.duration = (lastEntry.renderTime || lastEntry.loadTime) * 1000000;
+        sendSpan(span);
+      });
+      try {
+        observeLCP.observe({ type: 'largest-contentful-paint', buffered: true });
+      } catch (e) {
+        if (config.debug) console.warn('[OTEL] LCP not supported');
+      }
+
+      // First Input Delay (FID)
+      const observeFID = new PerformanceObserver((list) => {
+        const firstInput = list.getEntries()[0];
+        const span = createSpan('web.vital.fid', {
+          'web.vital.name': 'FID',
+          'web.vital.value': firstInput.processingStart - firstInput.startTime,
+          'web.vital.rating': firstInput.processingStart - firstInput.startTime < 100 ? 'good' : 'poor',
+          'interaction.type': firstInput.name
+        }, activeSpanContext.activePageViewSpanId); // Child of page_view
+        span.duration = (firstInput.processingStart - firstInput.startTime) * 1000000;
+        sendSpan(span);
+      });
+      try {
+        observeFID.observe({ type: 'first-input', buffered: true });
+      } catch (e) {
+        if (config.debug) console.warn('[OTEL] FID not supported');
+      }
+
+      // Cumulative Layout Shift (CLS)
+      let clsValue = 0;
+      const observeCLS = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          if (!entry.hadRecentInput) {
+            clsValue += entry.value;
+          }
+        }
+      });
+      try {
+        observeCLS.observe({ type: 'layout-shift', buffered: true });
+      } catch (e) {
+        if (config.debug) console.warn('[OTEL] CLS not supported');
+      }
+
+      // Report CLS on page hide
+      window.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden' && clsValue > 0) {
+          const span = createSpan('web.vital.cls', {
+            'web.vital.name': 'CLS',
+            'web.vital.value': clsValue,
+            'web.vital.rating': clsValue < 0.1 ? 'good' : clsValue < 0.25 ? 'needs-improvement' : 'poor'
+          }, activeSpanContext.activePageViewSpanId); // Child of page_view
+          sendSpan(span);
+        }
+      });
+    }
+
+    // Track user interactions
+    if (config.captureInteractions) {
+      ['click', 'submit'].forEach(eventType => {
+        document.addEventListener(eventType, (e) => {
+          const target = e.target;
+
+          // Determine event name and category based on context
+          let eventName = `user_${eventType}`;
+          let eventCategory = 'engagement';
+
+          // Special handling for links and downloads
+          if (eventType === 'click') {
+            const href = target.href || target.closest('a')?.href || '';
+            const text = (target.innerText || '').toLowerCase();
+
+            if (href.includes('/resume') || text.includes('resume')) {
+              eventName = 'resume_click';
+              if (href.endsWith('.pdf') || href.includes('download')) {
+                eventName = 'resume_download';
+                eventCategory = 'conversion';
+              }
+            } else if (href.includes('/cv') || text.includes('cv')) {
+              eventName = 'cv_click';
+              if (href.endsWith('.pdf') || href.includes('download')) {
+                eventName = 'cv_download';
+                eventCategory = 'conversion';
+              }
+            } else if (href) {
+              try {
+                const hrefUrl = new URL(href, window.location.origin);
+                if (hrefUrl.hostname !== window.location.hostname) {
+                  eventName = 'outbound_click';
+                }
+              } catch (e) {
+                // Invalid URL, ignore
+              }
+            }
+          }
+
+          const span = createSpan(eventName, {
+            'event.name': eventName,
+            'event.category': eventCategory,
+            'interaction.type': eventType,
+            'interaction.target.tag': target.tagName,
+            'interaction.target.id': target.id || '',
+            'interaction.target.class': target.className || '',
+            'interaction.target.text': target.innerText?.substring(0, 100) || '',
+            'interaction.target.href': target.href || target.closest('a')?.href || ''
+          }, activeSpanContext.activePageViewSpanId); // Child of page_view
+          sendSpan(span);
+        }, { passive: true });
+      });
+    }
+
+    // Track errors
+    if (config.captureErrors) {
+      window.addEventListener('error', (event) => {
+        const span = createSpan('error', {
+          'exception.type': event.error?.name || 'Error',
+          'exception.message': event.message,
+          'exception.stacktrace': event.error?.stack || '',
+          'error.filename': event.filename,
+          'error.lineno': event.lineno,
+          'error.colno': event.colno
+        }, activeSpanContext.activePageViewSpanId); // Child of page_view
+        sendSpan(span);
+      });
+
+      window.addEventListener('unhandledrejection', (event) => {
+        const span = createSpan('unhandled_rejection', {
+          'exception.type': 'UnhandledRejection',
+          'exception.message': event.reason?.message || String(event.reason)
+        }, activeSpanContext.activePageViewSpanId); // Child of page_view
+        sendSpan(span);
+      });
+    }
+
+    // Track navigation timing
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        const perfData = performance.getEntriesByType('navigation')[0];
+        if (perfData) {
+          const span = createSpan('navigation', {
+            'navigation.type': perfData.type,
+            'navigation.dns': perfData.domainLookupEnd - perfData.domainLookupStart,
+            'navigation.tcp': perfData.connectEnd - perfData.connectStart,
+            'navigation.request': perfData.responseStart - perfData.requestStart,
+            'navigation.response': perfData.responseEnd - perfData.responseStart,
+            'navigation.dom_processing': perfData.domComplete - perfData.domInteractive,
+            'navigation.load_time': perfData.loadEventEnd - perfData.fetchStart
+          }, activeSpanContext.activePageViewSpanId); // Child of page_view
+          span.duration = (perfData.loadEventEnd - perfData.fetchStart) * 1000000;
+          sendSpan(span);
+        }
+      }, 0);
+    });
+
+    // Track initial page view
+    trackPageView();
+
+    // Track SPA navigation (for history.pushState/replaceState)
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+
+    history.pushState = function(...args) {
+      originalPushState.apply(this, args);
+      trackPageView();
+    };
+
+    history.replaceState = function(...args) {
+      originalReplaceState.apply(this, args);
+      trackPageView();
+    };
+
+    window.addEventListener('popstate', trackPageView);
+
+    // Mark SDK as ready AFTER all setup complete
+    sdkReady = true;
+
+    // Flush any queued events
+    if (eventQueue.length > 0) {
+      if (config.debug) {
+        console.log(`[OTEL] Flushing ${eventQueue.length} queued events`);
+      }
+      flushEventQueue();
+    }
+
+    if (config.debug) {
+      console.log('[OTEL] Browser instrumentation initialized and ready');
+    }
+
+    // Expose API for custom tracking
+    window.otel = {
+      trackEvent: (name, attributes) => {
+        const span = createSpan(name, attributes, activeSpanContext.activePageViewSpanId);
+        sendSpan(span);
+      },
+      setAttributes: (attrs) => {
+        config.customAttributes = { ...config.customAttributes, ...attrs };
+      }
+    };
+  }
+
+  // Helper functions
+  function generateTraceId() {
+    return Array.from({ length: 32 }, () =>
+      Math.floor(Math.random() * 16).toString(16)
+    ).join('');
+  }
+
+  function generateSpanId() {
+    return Array.from({ length: 16 }, () =>
+      Math.floor(Math.random() * 16).toString(16)
+    ).join('');
+  }
+
+  // Initialization promise tracking
+  let initPromise = null;
+
+  // Wrap initOtelBrowser to return promise and prevent duplicate initialization
+  const originalInit = initOtelBrowser;
+  window.initOtelBrowser = async function(userConfig) {
+    if (initPromise) {
+      console.warn('[OTEL] Already initialized, returning existing promise');
+      return initPromise;
+    }
+
+    initPromise = originalInit(userConfig);
+    return initPromise;
+  };
+
+  // Add ready check helper
+  window.otelReady = function() {
+    return sdkReady;
+  };
+
+  // Add wait helper with timeout
+  window.waitForOtel = async function(timeout = 5000) {
+    if (sdkReady) return true;
+
+    return new Promise((resolve) => {
+      const startTime = Date.now();
+      const interval = setInterval(() => {
+        if (sdkReady) {
+          clearInterval(interval);
+          resolve(true);
+        } else if (Date.now() - startTime > timeout) {
+          clearInterval(interval);
+          console.warn('[OTEL] Timeout waiting for SDK ready');
+          resolve(false);
+        }
+      }, 100);
+    });
+  };
+
+  // ═══ CONSENT MODULE ═══
+  if (!window.__ogConsentLoaded) {
+    window.__ogConsentLoaded = true;
+
+    var CONSENT_STORAGE_KEY = 'og_consent';
+
+    var STRICT_TIMEZONE_PREFIXES = [
+      'Europe/',
+      'America/Sao_Paulo', 'America/Noronha', 'America/Bahia', 'America/Fortaleza',
+      'America/Recife', 'America/Araguaina', 'America/Maceio', 'America/Belem',
+      'America/Santarem', 'America/Porto_Velho', 'America/Boa_Vista',
+      'America/Manaus', 'America/Cuiaba', 'America/Campo_Grande',
+      'America/Rio_Branco', 'America/Eirunepe',
+      'Africa/Johannesburg', 'Asia/Seoul', 'Asia/Tokyo',
+      'Asia/Kolkata', 'Asia/Calcutta', 'Asia/Bangkok', 'Asia/Singapore', 'Asia/Dubai',
+      'Africa/Nairobi', 'Africa/Lagos',
+      'America/Argentina/', 'America/Santiago', 'America/Bogota', 'Atlantic/Reykjavik'
+    ];
+
+    var STRICT_LANGUAGE_PREFIXES = [
+      'de', 'fr', 'it', 'es', 'pt', 'nl', 'pl', 'cs', 'sk', 'hu', 'ro',
+      'bg', 'hr', 'sl', 'et', 'lv', 'lt', 'fi', 'sv', 'da', 'el', 'ga',
+      'mt', 'no', 'is', 'ko', 'ja', 'th', 'hi', 'ta', 'te', 'mr', 'bn'
+    ];
+
+    function detectJurisdiction() {
+      if (window.__ogJurisdictionOverride) return window.__ogJurisdictionOverride;
+      var signals = { timezone: null, language: null, languages: [] };
+      try { signals.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+      signals.language = navigator.language || '';
+      signals.languages = Array.from(navigator.languages || []);
+      if (signals.timezone) {
+        var tzMatch = STRICT_TIMEZONE_PREFIXES.some(function(p) { return signals.timezone.indexOf(p) === 0; });
+        if (tzMatch) return { level: 'strict', jurisdiction: signals.timezone, signals: signals };
+        return { level: 'standard', jurisdiction: signals.timezone, signals: signals };
+      }
+      var langCode = signals.language.split('-')[0].toLowerCase();
+      var langMatch = STRICT_LANGUAGE_PREFIXES.some(function(p) { return langCode === p; });
+      if (langMatch) return { level: 'strict', jurisdiction: 'lang:' + signals.language, signals: signals };
+      if (!signals.timezone && !signals.language) return { level: 'strict', jurisdiction: 'unknown', signals: signals };
+      return { level: 'standard', jurisdiction: signals.timezone || 'lang:' + signals.language, signals: signals };
+    }
+
+    function getStoredConsent() {
+      try {
+        var raw = localStorage.getItem(CONSENT_STORAGE_KEY);
+        if (!raw) return null;
+        var consent = JSON.parse(raw);
+        var stored = new Date(consent.timestamp);
+        var expiryMs = (consent.expiry || 365) * 24 * 60 * 60 * 1000;
+        if (Date.now() - stored.getTime() > expiryMs) { localStorage.removeItem(CONSENT_STORAGE_KEY); return null; }
+        return consent;
+      } catch (e) { return null; }
+    }
+
+    function storeConsent(status, expiryDays, jurisdiction, consentLevel) {
+      try {
+        localStorage.setItem(CONSENT_STORAGE_KEY, JSON.stringify({
+          status: status, timestamp: new Date().toISOString(), expiry: expiryDays,
+          jurisdiction: jurisdiction, consentLevel: consentLevel, version: 1
+        }));
+      } catch (e) {}
+    }
+
+    function checkDNT() {
+      return navigator.doNotTrack === '1' || navigator.doNotTrack === 'yes' || window.doNotTrack === '1';
+    }
+
+    function getGooseSVG(size) {
+      return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="' + size + '" height="' + size + '" role="img" aria-label="OpenGander goose mascot">' +
+        '<ellipse cx="60" cy="78" rx="30" ry="24" fill="#F8F9FA" stroke="#374151" stroke-width="2"/>' +
+        '<path d="M52 58 Q48 38 42 28 Q38 20 44 16" fill="none" stroke="#F8F9FA" stroke-width="12"/>' +
+        '<path d="M52 58 Q48 38 42 28 Q38 20 44 16" fill="none" stroke="#374151" stroke-width="2"/>' +
+        '<circle cx="44" cy="16" r="10" fill="#F8F9FA" stroke="#374151" stroke-width="2"/>' +
+        '<circle cx="41" cy="14" r="2.5" fill="#374151"/><circle cx="40.5" cy="13.5" r="0.8" fill="#FFFFFF"/>' +
+        '<path d="M34 17 L26 19 L34 21 Z" fill="#F59E0B" stroke="#D97706" stroke-width="1"/>' +
+        '<path d="M55 65 Q72 60 80 70 Q75 80 58 78" fill="#E5E7EB" stroke="#374151" stroke-width="1.5"/>' +
+        '<path d="M48 100 L42 108 L52 108 Z" fill="#F59E0B" stroke="#D97706" stroke-width="1"/>' +
+        '<path d="M68 100 L62 108 L72 108 Z" fill="#F59E0B" stroke="#D97706" stroke-width="1"/>' +
+        '<rect x="70" y="50" width="18" height="24" rx="2" fill="#FEF3C7" stroke="#D97706" stroke-width="1.5"/>' +
+        '<rect x="74" y="48" width="10" height="5" rx="1" fill="none" stroke="#D97706" stroke-width="1.5"/>' +
+        '<line x1="74" y1="58" x2="84" y2="58" stroke="#D97706" stroke-width="1" opacity="0.5"/>' +
+        '<line x1="74" y1="62" x2="84" y2="62" stroke="#D97706" stroke-width="1" opacity="0.5"/>' +
+        '<line x1="74" y1="66" x2="80" y2="66" stroke="#D97706" stroke-width="1" opacity="0.5"/>' +
+        '</svg>';
+    }
+
+    function injectConsentStyles(position, theme) {
+      var isDark = theme === 'dark' || (theme === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      var colors = isDark ? {
+        bg: '#1F2937', text: '#F9FAFB', textMuted: '#9CA3AF', border: '#374151',
+        acceptBg: '#F59E0B', acceptText: '#1F2937', acceptHover: '#D97706',
+        declineBg: 'transparent', declineText: '#9CA3AF', declineBorder: '#4B5563',
+        overlay: 'rgba(0, 0, 0, 0.7)', tagBg: '#374151'
+      } : {
+        bg: '#FFFFFF', text: '#1F2937', textMuted: '#6B7280', border: '#E5E7EB',
+        acceptBg: '#F59E0B', acceptText: '#1F2937', acceptHover: '#D97706',
+        declineBg: 'transparent', declineText: '#6B7280', declineBorder: '#D1D5DB',
+        overlay: 'rgba(0, 0, 0, 0.5)', tagBg: '#F3F4F6'
+      };
+      var style = document.createElement('style');
+      style.id = 'og-consent-styles';
+      style.textContent =
+        '[class^="og-consent"] { box-sizing: border-box; margin: 0; padding: 0; }' +
+        '[class^="og-consent"] * { box-sizing: border-box; margin: 0; padding: 0; }' +
+        '.og-consent-banner { position: fixed; ' + (position === 'top' ? 'top: 0;' : 'bottom: 0;') +
+          ' left: 0; right: 0; z-index: 2147483647; background: ' + colors.bg + ';' +
+          ' border-' + (position === 'top' ? 'bottom' : 'top') + ': 1px solid ' + colors.border + ';' +
+          ' box-shadow: 0 -4px 20px rgba(0,0,0,0.1); padding: 16px 24px;' +
+          ' font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;' +
+          ' animation: og-slide-in 0.3s ease-out; }' +
+        '.og-consent-banner-inner { max-width: 1200px; margin: 0 auto; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }' +
+        '.og-consent-gate { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 2147483647;' +
+          ' background: ' + colors.overlay + '; display: flex; align-items: center; justify-content: center;' +
+          ' font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; animation: og-fade-in 0.3s ease-out; }' +
+        '.og-consent-gate-card { background: ' + colors.bg + '; border-radius: 16px; padding: 40px;' +
+          ' max-width: 480px; width: 90%; text-align: center; box-shadow: 0 25px 50px rgba(0,0,0,0.25); animation: og-scale-in 0.3s ease-out; }' +
+        '.og-consent-goose { flex-shrink: 0; animation: og-waddle 2s ease-in-out infinite; }' +
+        '.og-consent-text { flex: 1; min-width: 200px; }' +
+        '.og-consent-heading { font-size: 16px; font-weight: 600; color: ' + colors.text + '; margin-bottom: 4px; line-height: 1.4; }' +
+        '.og-consent-body { font-size: 14px; color: ' + colors.textMuted + '; line-height: 1.5; }' +
+        '.og-consent-body a { color: ' + colors.acceptBg + '; text-decoration: underline; }' +
+        '.og-consent-gate .og-consent-heading { font-size: 22px; margin-bottom: 8px; }' +
+        '.og-consent-gate .og-consent-body { font-size: 15px; margin-bottom: 24px; }' +
+        '.og-consent-actions { display: flex; gap: 8px; flex-shrink: 0; align-items: center; }' +
+        '.og-consent-gate .og-consent-actions { justify-content: center; gap: 12px; }' +
+        '.og-consent-btn { padding: 8px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; border: none; transition: all 0.15s ease; line-height: 1.4; white-space: nowrap; }' +
+        '.og-consent-btn-accept { background: ' + colors.acceptBg + '; color: ' + colors.acceptText + '; }' +
+        '.og-consent-btn-accept:hover { background: ' + colors.acceptHover + '; transform: scale(1.02); }' +
+        '.og-consent-btn-decline { background: ' + colors.declineBg + '; color: ' + colors.declineText + '; border: 1px solid ' + colors.declineBorder + '; }' +
+        '.og-consent-btn-decline:hover { opacity: 0.8; }' +
+        '.og-consent-details { font-size: 12px; color: ' + colors.textMuted + '; margin-top: 12px; padding-top: 12px; border-top: 1px solid ' + colors.border + '; text-align: left; }' +
+        '.og-consent-details span { display: inline-block; margin: 2px 4px; padding: 2px 8px; border-radius: 4px; background: ' + colors.tagBg + '; font-size: 11px; }' +
+        '.og-consent-powered { font-size: 11px; color: ' + colors.textMuted + '; margin-top: 12px; opacity: 0.7; }' +
+        '.og-consent-powered a { color: inherit; text-decoration: none; }' +
+        '.og-consent-powered a:hover { text-decoration: underline; }' +
+        '.og-consent-jurisdiction { font-size: 10px; color: ' + colors.textMuted + '; margin-top: 8px; opacity: 0.5; }' +
+        '@keyframes og-slide-in { from { transform: translateY(' + (position === 'top' ? '-100%' : '100%') + '); } to { transform: translateY(0); } }' +
+        '@keyframes og-fade-in { from { opacity: 0; } to { opacity: 1; } }' +
+        '@keyframes og-scale-in { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }' +
+        '@keyframes og-waddle { 0%, 100% { transform: rotate(0deg); } 25% { transform: rotate(3deg); } 75% { transform: rotate(-3deg); } }' +
+        '@media (max-width: 640px) { .og-consent-banner-inner { flex-direction: column; text-align: center; } .og-consent-actions { width: 100%; justify-content: center; } .og-consent-gate-card { padding: 24px; } }';
+      document.head.appendChild(style);
+    }
+
+    function renderConsentBanner(consentConfig, onAccept, onDecline) {
+      injectConsentStyles('bottom', consentConfig.theme);
+      var heading = consentConfig.text.heading || 'Honk! Quick heads-up.';
+      var body = consentConfig.text.body ||
+        'This site uses <strong>OpenGander</strong> to understand page performance and how visitors find us. ' +
+        'We collect page views, load times, and traffic sources \u2014 <strong>no personal info, no cross-site tracking</strong>.' +
+        (consentConfig.privacyUrl ? ' <a href="' + consentConfig.privacyUrl + '">Learn more</a>.' : '');
+      var acceptText = consentConfig.text.accept || 'Sounds good';
+      var declineText = consentConfig.text.decline || 'No thanks';
+      var el = document.createElement('div');
+      el.className = 'og-consent-banner';
+      el.setAttribute('role', 'dialog');
+      el.setAttribute('aria-label', 'Analytics consent');
+      el.innerHTML =
+        '<div class="og-consent-banner-inner">' +
+          '<div class="og-consent-goose">' + getGooseSVG(56) + '</div>' +
+          '<div class="og-consent-text">' +
+            '<div class="og-consent-heading">' + heading + '</div>' +
+            '<div class="og-consent-body">' + body + '</div>' +
+          '</div>' +
+          '<div class="og-consent-actions">' +
+            '<button class="og-consent-btn og-consent-btn-accept" data-action="accept">' + acceptText + '</button>' +
+            '<button class="og-consent-btn og-consent-btn-decline" data-action="decline">' + declineText + '</button>' +
+          '</div>' +
+        '</div>';
+      el.querySelector('[data-action="accept"]').addEventListener('click', function() {
+        el.style.animation = 'og-slide-in 0.2s ease-in reverse';
+        setTimeout(function() { el.remove(); }, 200);
+        onAccept();
+      });
+      el.querySelector('[data-action="decline"]').addEventListener('click', function() {
+        el.style.animation = 'og-slide-in 0.2s ease-in reverse';
+        setTimeout(function() { el.remove(); }, 200);
+        onDecline();
+      });
+      document.body.appendChild(el);
+    }
+
+    function renderConsentGate(consentConfig, jurisdiction, onAccept, onDecline) {
+      injectConsentStyles('bottom', consentConfig.theme);
+      var heading = consentConfig.text.heading || 'Before you come in...';
+      var body = consentConfig.text.body ||
+        'This site uses <strong>OpenGander</strong> analytics to measure page performance and understand how visitors arrive. ' +
+        'Here\u2019s exactly what we track:';
+      var acceptText = consentConfig.text.accept || 'That\u2019s fine, let me in';
+      var declineText = consentConfig.text.decline || 'I\u2019d rather not';
+      var el = document.createElement('div');
+      el.className = 'og-consent-gate';
+      el.setAttribute('role', 'dialog');
+      el.setAttribute('aria-modal', 'true');
+      el.setAttribute('aria-label', 'Analytics consent');
+      el.innerHTML =
+        '<div class="og-consent-gate-card">' +
+          '<div class="og-consent-goose" style="margin-bottom: 16px;">' + getGooseSVG(80) + '</div>' +
+          '<div class="og-consent-heading">' + heading + '</div>' +
+          '<div class="og-consent-body">' + body +
+            (consentConfig.privacyUrl ? ' <a href="' + consentConfig.privacyUrl + '">Full privacy policy</a>.' : '') +
+          '</div>' +
+          '<div class="og-consent-details"><span>Page views</span><span>Load times</span><span>Traffic source</span><span>Device type</span><span>JS errors</span><span>Click events</span></div>' +
+          '<div class="og-consent-details" style="border-top: none; padding-top: 4px; font-style: italic;">No names, emails, passwords, or personal info. Ever.</div>' +
+          '<div class="og-consent-actions" style="margin-top: 20px;">' +
+            '<button class="og-consent-btn og-consent-btn-accept" data-action="accept">' + acceptText + '</button>' +
+            '<button class="og-consent-btn og-consent-btn-decline" data-action="decline">' + declineText + '</button>' +
+          '</div>' +
+          '<div class="og-consent-powered">Powered by <a href="https://opengander.com" target="_blank" rel="noopener">OpenGander</a></div>' +
+          '<div class="og-consent-jurisdiction" title="Detected jurisdiction">' + jurisdiction.jurisdiction + '</div>' +
+        '</div>';
+      el.querySelector('[data-action="accept"]').addEventListener('click', function() {
+        el.style.animation = 'og-fade-in 0.2s ease-in reverse';
+        setTimeout(function() { el.remove(); }, 200);
+        onAccept();
+      });
+      el.querySelector('[data-action="decline"]').addEventListener('click', function() {
+        el.style.animation = 'og-fade-in 0.2s ease-in reverse';
+        setTimeout(function() { el.remove(); }, 200);
+        onDecline();
+      });
+      document.body.appendChild(el);
+    }
+
+    var realInit = window.initOtelBrowser;
+    if (realInit) {
+      window.initOtelBrowser = async function(userConfig) {
+        var consentConfig = Object.assign({ theme: 'auto', privacyUrl: null, expiry: 365, onConsent: null, text: {} }, userConfig.consent || {});
+        consentConfig.text = Object.assign({ heading: null, body: null, accept: null, decline: null }, consentConfig.text || {});
+        if (checkDNT()) { if (consentConfig.onConsent) consentConfig.onConsent(false, 'dnt'); return; }
+        var jurisdiction = detectJurisdiction();
+        var stored = getStoredConsent();
+        if (stored) {
+          if (jurisdiction.level === 'strict' && stored.consentLevel !== 'strict') { localStorage.removeItem(CONSENT_STORAGE_KEY); stored = null; }
+        }
+        if (stored) {
+          if (stored.status === 'granted') return realInit(userConfig);
+          if (consentConfig.onConsent) consentConfig.onConsent(false, jurisdiction.jurisdiction);
+          return;
+        }
+        return new Promise(function(resolve) {
+          function onAccept() {
+            storeConsent('granted', consentConfig.expiry, jurisdiction.jurisdiction, jurisdiction.level);
+            if (consentConfig.onConsent) consentConfig.onConsent(true, jurisdiction.jurisdiction);
+            realInit(userConfig).then(resolve);
+          }
+          function onDecline() {
+            storeConsent('denied', consentConfig.expiry, jurisdiction.jurisdiction, jurisdiction.level);
+            if (consentConfig.onConsent) consentConfig.onConsent(false, jurisdiction.jurisdiction);
+            resolve();
+          }
+          function show() {
+            if (jurisdiction.level === 'strict') { renderConsentGate(consentConfig, jurisdiction, onAccept, onDecline); }
+            else { renderConsentBanner(consentConfig, onAccept, onDecline); }
+          }
+          if (document.body) { show(); } else { document.addEventListener('DOMContentLoaded', show); }
+        });
+      };
+    }
+
+    window.OpenGanderConsent = {
+      getStatus: function() { var s = getStoredConsent(); return s ? s.status : 'pending'; },
+      getRecord: function() { return getStoredConsent(); },
+      getJurisdiction: function() { return detectJurisdiction(); },
+      grant: function() { var j = detectJurisdiction(); storeConsent('granted', 365, j.jurisdiction, j.level); },
+      deny: function() { var j = detectJurisdiction(); storeConsent('denied', 365, j.jurisdiction, j.level); },
+      revoke: function() {
+        localStorage.removeItem(CONSENT_STORAGE_KEY);
+        var keys = Object.keys(localStorage);
+        for (var i = 0; i < keys.length; i++) {
+          if (keys[i].indexOf('otel_') === 0 || keys[i].indexOf('og_') === 0) localStorage.removeItem(keys[i]);
+        }
+      },
+      reset: function() { localStorage.removeItem(CONSENT_STORAGE_KEY); },
+      show: function(options) {
+        options = options || {};
+        var consentConfig = { theme: options.theme || 'auto', privacyUrl: options.privacyUrl || null, text: options.text || {} };
+        var jurisdiction = detectJurisdiction();
+        var existing = document.querySelector('.og-consent-banner, .og-consent-gate');
+        if (existing) existing.remove();
+        var existingStyles = document.getElementById('og-consent-styles');
+        if (existingStyles) existingStyles.remove();
+        function onAccept() { storeConsent('granted', options.expiry || 365, jurisdiction.jurisdiction, jurisdiction.level); if (options.onConsent) options.onConsent(true, jurisdiction.jurisdiction); }
+        function onDecline() { storeConsent('denied', options.expiry || 365, jurisdiction.jurisdiction, jurisdiction.level); if (options.onConsent) options.onConsent(false, jurisdiction.jurisdiction); }
+        if (jurisdiction.level === 'strict') { renderConsentGate(consentConfig, jurisdiction, onAccept, onDecline); }
+        else { renderConsentBanner(consentConfig, onAccept, onDecline); }
+        return jurisdiction;
+      }
+    };
+  } // end consent module
+  // ═══ END CONSENT MODULE ═══
+})();
+</script>
+
+<!-- Initialize the SDK - UPDATE THIS CONFIGURATION FOR YOUR SITE -->
+<script>
+  initOtelBrowser({
+    serviceName: 'ghost-blog',  // Change this to your site name
+    collectorUrl: 'https://your-otel-collector.com/v1/traces',  // Change to your collector URL
+    tokenEndpoint: '/api/telemetry-token',  // Optional: your token endpoint
+    debug: false,  // Set to true for testing, false for production
+    sampleRate: 1.0,  // 100% sampling - reduce for high-traffic sites (e.g., 0.1 = 10%)
+    consent: { privacyUrl: '/privacy' },  // Optional: link to your privacy policy
+    customAttributes: {
+      'site.type': 'blog',
+      'cms': 'ghost'
+    }
+  });
+</script>
