@@ -116,7 +116,7 @@ Privacy is built in: the SDK redacts sensitive URL parameters (token, password, 
 
 ## Design Decisions
 
-- **Vanilla JavaScript, no build step.** Single `.js` file that works anywhere — Ghost blogs, static HTML, SPAs. No TypeScript, no bundler, no npm install.
+- **Vanilla JavaScript, no build step.** Single `.js` file that works anywhere — Ghost blogs, static HTML, SPAs. No TypeScript, no bundler, no npm install. There's no `package.json` because there's nothing to install — just a `<script>` tag.
 - **Token-based auth over API keys.** Short-lived JWTs bound to origin + IP replace static API keys that anyone could copy.
 - **Ghost inline variant.** `ghost-inline.html` bundles everything into a single paste-able `<script>` block for Ghost's code injection.
 
