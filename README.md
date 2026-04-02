@@ -4,6 +4,10 @@ Browser-based Real User Monitoring SDK that tracks page views, SPA navigation, W
 
 This is the source code for the script that runs on sites using [OpenGander](https://opengander.io). It's published here so you can read exactly what it does.
 
+## Why Open Source?
+
+This repo exists for transparency. The SDK runs on your site, in your visitors' browsers — you should be able to read every line of it. This isn't a community project looking for contributors; it's a read-only reference so you can verify what the code does, audit the data it collects, and confirm it matches what's served from our CDN. Fork it if you want. The companion [browser extension](https://github.com/opengander/opengander-extension) is published for the same reason.
+
 ## Quick Start
 
 ```html
