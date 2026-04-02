@@ -668,6 +668,11 @@
         'Signals:', jurisdiction.signals);
     }
 
+    if (jurisdiction.level === 'strict' && !consentConfig.privacyUrl) {
+      console.warn('[OpenGander] GDPR requires a link to your privacy policy at the point of consent. ' +
+        'Set consent.privacyUrl in your config to comply with STRICT jurisdiction requirements.');
+    }
+
     // ── Check stored consent ──
     var stored = getStoredConsent();
 
