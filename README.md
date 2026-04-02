@@ -127,7 +127,7 @@ Privacy is built in: the SDK redacts sensitive URL parameters (token, password, 
 | `opengander-sdk.js` | Main SDK with bundled consent |
 | `opengander-consent.js` | Standalone consent module (bundled into the SDK — provided for reference) |
 | `ghost-inline.html` | Self-contained version for Ghost blogs |
-| `test-*.html` | Local test pages for development |
+| `test/*.html` | Local test pages for development |
 
 ## License
 

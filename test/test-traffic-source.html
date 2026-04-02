@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Traffic Source Fix Test</title>
+  <style>
+    body {
+      font-family: monospace;
+      padding: 20px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .section {
+      margin: 20px 0;
+      padding: 15px;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+    }
+    .success { background: #d4edda; border-color: #c3e6cb; }
+    .warning { background: #fff3cd; border-color: #ffeaa7; }
+    .info { background: #d1ecf1; border-color: #bee5eb; }
+    button {
+      padding: 10px 15px;
+      margin: 5px;
+      cursor: pointer;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 10px;
+      overflow-x: auto;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-top: 10px;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+    th { background: #f2f2f2; }
+  </style>
+</head>
+<body>
+  <h1>🧪 Traffic Source Attribution Fix - Test Page</h1>
+
+  <div class="section info">
+    <h2>Current Session State</h2>
+    <div id="sessionState"></div>
+  </div>
+
+  <div class="section">
+    <h2>Test Controls</h2>
+    <button onclick="clearStorage()">🗑️ Clear All LocalStorage</button>
+    <button onclick="simulateNewSession()">🔄 Simulate New Session (30min timeout)</button>
+    <button onclick="simulateReferrer('https://chat.openai.com')">🤖 Simulate ChatGPT Referrer</button>
+    <button onclick="simulateReferrer('https://www.google.com/search?q=test')">🔍 Simulate Google Referrer</button>
+    <button onclick="simulateReferrer('https://www.perplexity.ai')">💡 Simulate Perplexity Referrer</button>
+    <button onclick="simulateReferrer('')">🏠 Simulate Direct Visit</button>
+    <button onclick="refreshState()">♻️ Refresh Display</button>
+  </div>
+
+  <div class="section">
+    <h2>Traffic Source Test Results</h2>
+    <div id="testResults"></div>
+  </div>
+
+  <div class="section">
+    <h2>LocalStorage Contents</h2>
+    <div id="storageContents"></div>
+  </div>
+
+  <div class="section">
+    <h2>Expected Behavior</h2>
+    <ul>
+      <li>✅ Traffic source captured ONCE at session start</li>
+      <li>✅ Traffic source persists across page navigations within same session</li>
+      <li>✅ ChatGPT, Perplexity, and other new search engines recognized</li>
+      <li>✅ New session (after 30min timeout) captures new traffic source</li>
+      <li>❌ Traffic source should NOT change mid-session</li>
+    </ul>
+  </div>
+
+  <script src="web-sdk.js"></script>
+  <script>
+    // Initialize OTEL with debug mode
+    initOtelBrowser({
+      serviceName: 'test-traffic-source',
+      collectorUrl: 'http://localhost:4318/v1/traces',
+      debug: true,
+      sampleRate: 0  // Don't actually send spans during testing
+    });
+
+    function clearStorage() {
+      localStorage.clear();
+      alert('✅ LocalStorage cleared! Refresh the page to start a new session.');
+    }
+
+    function simulateNewSession() {
+      // Simulate session timeout by setting session_start to 31 minutes ago
+      const thirtyOneMinutesAgo = Date.now() - (31 * 60 * 1000);
+      localStorage.setItem('otel_session_start', thirtyOneMinutesAgo.toString());
+      alert('✅ Session timeout simulated! The next call to initUserSession() will create a new session.');
+      refreshState();
+    }
+
+    function simulateReferrer(url) {
+      alert(`⚠️ Cannot directly change document.referrer (read-only).\n\nTo test this:\n1. Create a link on another page pointing to this page\n2. Or manually set localStorage keys\n\nSimulating by clearing session and updating localStorage...`);
+
+      // Clear session to force new session
+      localStorage.removeItem('otel_session_id');
+      localStorage.removeItem('otel_session_start');
+
+      // The actual referrer would need to come from a real navigation
+      // For now, just refresh to trigger new session
+      location.reload();
+    }
+
+    function refreshState() {
+      displaySessionState();
+      displayTestResults();
+      displayStorageContents();
+    }
+
+    function displaySessionState() {
+      const userInfo = window.otel?.getUserInfo();
+      if (!userInfo) {
+        document.getElementById('sessionState').innerHTML = '<p style="color: red;">OTEL SDK not initialized</p>';
+        return;
+      }
+
+      const html = `
+        <table>
+          <tr><th>Property</th><th>Value</th></tr>
+          <tr><td>User ID</td><td>${userInfo.userId}</td></tr>
+          <tr><td>Session ID</td><td>${userInfo.sessionId}</td></tr>
+          <tr><td>Visit Count</td><td>${userInfo.visitCount}</td></tr>
+          <tr><td>New vs Returning</td><td>${userInfo.newVsReturning}</td></tr>
+          <tr><td>Is New Session</td><td>${userInfo.isNewSession ? '✅ Yes' : '❌ No'}</td></tr>
+          <tr style="background: #ffffcc;">
+            <td><strong>Traffic Source</strong></td>
+            <td><strong>${userInfo.trafficSource?.source || 'N/A'}</strong></td>
+          </tr>
+          <tr style="background: #ffffcc;">
+            <td><strong>Traffic Medium</strong></td>
+            <td><strong>${userInfo.trafficSource?.medium || 'N/A'}</strong></td>
+          </tr>
+          <tr style="background: #ffffcc;">
+            <td><strong>Traffic Channel</strong></td>
+            <td><strong>${userInfo.trafficSource?.channel || 'N/A'}</strong></td>
+          </tr>
+        </table>
+      `;
+      document.getElementById('sessionState').innerHTML = html;
+    }
+
+    function displayTestResults() {
+      const userInfo = window.otel?.getUserInfo();
+      if (!userInfo || !userInfo.trafficSource) {
+        document.getElementById('testResults').innerHTML = '<p style="color: red;">No traffic source data available</p>';
+        return;
+      }
+
+      const traffic = userInfo.trafficSource;
+      const tests = [];
+
+      // Test 1: Traffic source exists
+      tests.push({
+        name: 'Traffic source captured',
+        pass: !!traffic.source,
+        details: `Source: ${traffic.source}`
+      });
+
+      // Test 2: Check if search engines are recognized
+      const isSearchEngine = ['chatgpt', 'openai', 'perplexity', 'google', 'bing'].some(
+        engine => traffic.source?.includes(engine)
+      );
+      if (isSearchEngine) {
+        tests.push({
+          name: 'Search engine classification',
+          pass: traffic.channel === 'Organic Search',
+          details: `Expected "Organic Search", got "${traffic.channel}"`
+        });
+      }
+
+      // Test 3: Check localStorage persistence
+      const storedSource = localStorage.getItem('otel_traffic_source');
+      const storedMedium = localStorage.getItem('otel_traffic_medium');
+      tests.push({
+        name: 'Traffic source persisted to localStorage',
+        pass: storedSource === traffic.source && storedMedium === traffic.medium,
+        details: `Stored: ${storedSource}/${storedMedium}, Session: ${traffic.source}/${traffic.medium}`
+      });
+
+      // Test 4: Multiple calls return same traffic source
+      const userInfo2 = window.otel?.getUserInfo();
+      tests.push({
+        name: 'Traffic source consistent across calls',
+        pass: userInfo2.trafficSource.source === traffic.source,
+        details: 'Calling getUserInfo() twice returns identical traffic source'
+      });
+
+      const html = tests.map(test => `
+        <div style="padding: 10px; margin: 5px 0; background: ${test.pass ? '#d4edda' : '#f8d7da'}; border-radius: 3px;">
+          <strong>${test.pass ? '✅' : '❌'} ${test.name}</strong><br>
+          <small>${test.details}</small>
+        </div>
+      `).join('');
+
+      document.getElementById('testResults').innerHTML = html;
+    }
+
+    function displayStorageContents() {
+      const otelKeys = Object.keys(localStorage).filter(key => key.startsWith('otel_'));
+
+      if (otelKeys.length === 0) {
+        document.getElementById('storageContents').innerHTML = '<p style="color: orange;">No OTEL keys in localStorage</p>';
+        return;
+      }
+
+      const html = `
+        <table>
+          <tr><th>Key</th><th>Value</th></tr>
+          ${otelKeys.map(key => `
+            <tr style="${key.includes('traffic') ? 'background: #ffffcc;' : ''}">
+              <td><code>${key}</code></td>
+              <td><code>${localStorage.getItem(key)}</code></td>
+            </tr>
+          `).join('')}
+        </table>
+      `;
+      document.getElementById('storageContents').innerHTML = html;
+    }
+
+    // Auto-refresh every 2 seconds
+    setInterval(refreshState, 2000);
+
+    // Initial display
+    setTimeout(refreshState, 500);
+  </script>
+</body>
+</html>

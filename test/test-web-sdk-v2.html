@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web SDK v2 Test</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .test-section {
+      border: 1px solid #ccc;
+      padding: 20px;
+      margin: 20px 0;
+      border-radius: 5px;
+    }
+    .test-section h2 {
+      margin-top: 0;
+    }
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      cursor: pointer;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 10px;
+      border-radius: 3px;
+      overflow-x: auto;
+    }
+    .success {
+      color: green;
+      font-weight: bold;
+    }
+    .error {
+      color: red;
+      font-weight: bold;
+    }
+    a {
+      color: blue;
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <h1>Web SDK v2 Test Page</h1>
+  <p>This page tests the refactored v2 SDK with pattern-based configuration.</p>
+
+  <div class="test-section">
+    <h2>Test 1: Basic Initialization (Should Fail - No collectorUrl)</h2>
+    <button onclick="testNoCollectorUrl()">Test Missing collectorUrl</button>
+    <div id="test1-result"></div>
+  </div>
+
+  <div class="test-section">
+    <h2>Test 2: Generic Website (No Patterns)</h2>
+    <button onclick="testGenericSite()">Initialize Generic Site</button>
+    <div id="test2-result"></div>
+    <p>After initializing, click this link: <a href="/products/widget-1">Product Page</a></p>
+    <p>Content type should be inferred as "products" from URL structure.</p>
+  </div>
+
+  <div class="test-section">
+    <h2>Test 3: E-commerce Site (Custom Patterns)</h2>
+    <button onclick="testEcommerceSite()">Initialize E-commerce Site</button>
+    <div id="test3-result"></div>
+    <p>After initializing, test these links:</p>
+    <ul>
+      <li><a href="/products/shirt">Product Page</a> (should be content type: product_page)</li>
+      <li><a href="/cart/add?id=123">Add to Cart</a> (should trigger: add_to_cart conversion)</li>
+      <li><a href="/checkout/complete">Purchase Complete</a> (should trigger: purchase_complete conversion)</li>
+    </ul>
+  </div>
+
+  <div class="test-section">
+    <h2>Test 4: voidtalker.com (Backward Compatibility)</h2>
+    <button onclick="testVoidtalkerCompat()">Initialize with VOIDTALKER_COMPAT_PATTERNS</button>
+    <div id="test4-result"></div>
+    <p>After initializing, test these links:</p>
+    <ul>
+      <li><a href="/resume">Resume Page</a> (should be content type: resume)</li>
+      <li><a href="/musings/example-post">Blog Post</a> (should be content type: blog_post)</li>
+      <li><a href="/resume.pdf">Resume Download</a> (should trigger: resume_download conversion)</li>
+    </ul>
+  </div>
+
+  <div class="test-section">
+    <h2>Test 5: Custom Search Engines & Social Networks</h2>
+    <button onclick="testCustomEngines()">Initialize with Custom Engines</button>
+    <div id="test5-result"></div>
+    <p>After initializing, click this link to simulate referrer: <a href="#" onclick="alert('Simulated from kagi.com'); return false;">Kagi Search Referrer</a></p>
+    <p>Manual test: Set document.referrer to "https://kagi.com" to test traffic source classification.</p>
+  </div>
+
+  <div class="test-section">
+    <h2>Test 6: Consent Module (Bundled)</h2>
+    <p>The consent module is built into the SDK. Use these controls to test it.</p>
+    <button onclick="testConsentShow()">Show Consent UI</button>
+    <button onclick="testConsentStatus()">Check Status</button>
+    <button onclick="testConsentReset()">Reset Consent</button>
+    <button onclick="testConsentSimulateEU()">Simulate EU</button>
+    <button onclick="testConsentSimulateUS()">Simulate US</button>
+    <div id="test6-result"></div>
+  </div>
+
+  <div class="test-section">
+    <h2>Current Configuration</h2>
+    <button onclick="showCurrentConfig()">Show Config</button>
+    <div id="config-display"></div>
+  </div>
+
+  <!-- Include the OpenGander SDK -->
+  <script src="opengander-sdk.js"></script>
+
+  <!-- Test functions -->
+  <script>
+    let currentSdkInstance = null;
+
+    function testNoCollectorUrl() {
+      const resultDiv = document.getElementById('test1-result');
+      try {
+        initOtelBrowser({
+          serviceName: 'test-missing-collector',
+          debug: true
+        });
+        resultDiv.innerHTML = '<span class="error">FAIL: Should have thrown error</span>';
+      } catch (error) {
+        resultDiv.innerHTML = `<span class="success">SUCCESS: Got expected error</span><pre>${error.message}</pre>`;
+      }
+    }
+
+    function testGenericSite() {
+      const resultDiv = document.getElementById('test2-result');
+      try {
+        currentSdkInstance = initOtelBrowser({
+          serviceName: 'generic-site-test',
+          collectorUrl: 'https://otel.example.com/v1/traces',
+          debug: true
+          // No patterns - should use fallback behavior
+        });
+        resultDiv.innerHTML = '<span class="success">SUCCESS: Initialized generic site</span>';
+      } catch (error) {
+        resultDiv.innerHTML = `<span class="error">FAIL: ${error.message}</span>`;
+      }
+    }
+
+    function testEcommerceSite() {
+      const resultDiv = document.getElementById('test3-result');
+      try {
+        currentSdkInstance = initOtelBrowser({
+          serviceName: 'my-store-test',
+          collectorUrl: 'https://otel.example.com/v1/traces',
+          debug: true,
+          patterns: {
+            contentTypes: {
+              'product_page': { path: '/products/*' },
+              'category': { path: '/categories/*' },
+              'checkout': { path: '/checkout' }
+            },
+            conversions: [
+              {
+                name: 'add_to_cart',
+                match: { href: '/cart/add*' },
+                category: 'conversion'
+              },
+              {
+                name: 'purchase_complete',
+                match: { href: '/checkout/complete' },
+                category: 'conversion'
+              }
+            ]
+          }
+        });
+        resultDiv.innerHTML = '<span class="success">SUCCESS: Initialized e-commerce site with custom patterns</span>';
+      } catch (error) {
+        resultDiv.innerHTML = `<span class="error">FAIL: ${error.message}</span>`;
+      }
+    }
+
+    function testVoidtalkerCompat() {
+      const resultDiv = document.getElementById('test4-result');
+      try {
+        currentSdkInstance = initOtelBrowser({
+          serviceName: 'voidtalker-v2-test',
+          collectorUrl: 'https://otel.voidtalker.com/v1/traces',
+          debug: true,
+          patterns: window.VOIDTALKER_COMPAT_PATTERNS
+        });
+        resultDiv.innerHTML = '<span class="success">SUCCESS: Initialized with VOIDTALKER_COMPAT_PATTERNS</span><pre>' +
+          JSON.stringify(window.VOIDTALKER_COMPAT_PATTERNS, null, 2) + '</pre>';
+      } catch (error) {
+        resultDiv.innerHTML = `<span class="error">FAIL: ${error.message}</span>`;
+      }
+    }
+
+    function testCustomEngines() {
+      const resultDiv = document.getElementById('test5-result');
+      try {
+        currentSdkInstance = initOtelBrowser({
+          serviceName: 'custom-engines-test',
+          collectorUrl: 'https://otel.example.com/v1/traces',
+          debug: true,
+          patterns: {
+            contentTypes: {},
+            conversions: [],
+            searchEngines: ['kagi', 'neeva'],  // Add custom search engines
+            socialNetworks: ['mastodon.social', 'bsky.app']  // Add custom social networks
+          }
+        });
+        resultDiv.innerHTML = '<span class="success">SUCCESS: Initialized with custom search engines and social networks</span>';
+      } catch (error) {
+        resultDiv.innerHTML = `<span class="error">FAIL: ${error.message}</span>`;
+      }
+    }
+
+    function showCurrentConfig() {
+      const configDiv = document.getElementById('config-display');
+      if (window.otel && window.otel.getUserInfo) {
+        const userInfo = window.otel.getUserInfo();
+        const trafficSource = window.otel.getTrafficSource();
+        configDiv.innerHTML = '<h3>User & Session Info:</h3><pre>' +
+          JSON.stringify(userInfo, null, 2) + '</pre>' +
+          '<h3>Traffic Source:</h3><pre>' +
+          JSON.stringify(trafficSource, null, 2) + '</pre>';
+      } else {
+        configDiv.innerHTML = '<span class="error">SDK not initialized yet</span>';
+      }
+    }
+
+    // ── Consent test functions ──
+
+    function testConsentShow() {
+      var resultDiv = document.getElementById('test6-result');
+      try {
+        var j = OpenGanderConsent.show({ theme: 'auto', privacyUrl: '#privacy' });
+        resultDiv.innerHTML = '<span class="success">Consent UI shown</span> — Jurisdiction: ' +
+          j.level.toUpperCase() + ' (' + j.jurisdiction + ')';
+      } catch (e) {
+        resultDiv.innerHTML = '<span class="error">Error: ' + e.message + '</span>';
+      }
+    }
+
+    function testConsentStatus() {
+      var resultDiv = document.getElementById('test6-result');
+      try {
+        var status = OpenGanderConsent.getStatus();
+        var record = OpenGanderConsent.getRecord();
+        var jurisdiction = OpenGanderConsent.getJurisdiction();
+        resultDiv.innerHTML =
+          '<span class="success">Status: ' + status + '</span>' +
+          '<pre>' + JSON.stringify({ status: status, record: record, jurisdiction: jurisdiction }, null, 2) + '</pre>';
+      } catch (e) {
+        resultDiv.innerHTML = '<span class="error">Error: ' + e.message + '</span>';
+      }
+    }
+
+    function testConsentReset() {
+      var resultDiv = document.getElementById('test6-result');
+      OpenGanderConsent.reset();
+      delete window.__ogJurisdictionOverride;
+      var existing = document.querySelector('.og-consent-banner, .og-consent-gate');
+      if (existing) existing.remove();
+      var existingStyles = document.getElementById('og-consent-styles');
+      if (existingStyles) existingStyles.remove();
+      resultDiv.innerHTML = '<span class="success">Consent reset. UI removed.</span>';
+    }
+
+    function testConsentSimulateEU() {
+      var resultDiv = document.getElementById('test6-result');
+      window.__ogJurisdictionOverride = {
+        level: 'strict',
+        jurisdiction: 'Europe/Berlin',
+        signals: { timezone: 'Europe/Berlin', language: 'de-DE', languages: ['de-DE', 'en'] }
+      };
+      OpenGanderConsent.reset();
+      var j = OpenGanderConsent.show({ theme: 'auto', privacyUrl: '#privacy' });
+      resultDiv.innerHTML = '<span class="success">Simulating EU visitor</span> — ' +
+        j.level.toUpperCase() + ' (' + j.jurisdiction + ') — should show GATE';
+    }
+
+    function testConsentSimulateUS() {
+      var resultDiv = document.getElementById('test6-result');
+      window.__ogJurisdictionOverride = {
+        level: 'standard',
+        jurisdiction: 'America/New_York',
+        signals: { timezone: 'America/New_York', language: 'en-US', languages: ['en-US'] }
+      };
+      OpenGanderConsent.reset();
+      var j = OpenGanderConsent.show({ theme: 'auto', privacyUrl: '#privacy' });
+      resultDiv.innerHTML = '<span class="success">Simulating US visitor</span> — ' +
+        j.level.toUpperCase() + ' (' + j.jurisdiction + ') — should show BANNER';
+    }
+
+    // Log all clicks for debugging
+    document.addEventListener('click', function(e) {
+      const target = e.target;
+      if (target.tagName === 'A') {
+        console.log('[TEST] Link clicked:', {
+          href: target.href,
+          text: target.innerText,
+          pathname: new URL(target.href || window.location.href).pathname
+        });
+      }
+    });
+  </script>
+</body>
+</html>

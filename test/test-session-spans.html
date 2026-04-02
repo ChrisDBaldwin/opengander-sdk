@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Session Spans Test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px; background: #f8f9fa; color: #1f2937; }
+    h1 { margin-bottom: 8px; }
+    .subtitle { color: #6b7280; margin-bottom: 24px; }
+    .card { background: white; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 16px; margin-bottom: 12px; color: #374151; }
+    button { padding: 8px 16px; border-radius: 8px; border: 1px solid #d1d5db; background: white; cursor: pointer; font-size: 14px; margin: 4px; transition: all 0.15s; }
+    button:hover { background: #f3f4f6; border-color: #9ca3af; }
+    button.primary { background: #f59e0b; color: #1f2937; border-color: #f59e0b; font-weight: 500; }
+    button.primary:hover { background: #d97706; }
+    pre { background: #1f2937; color: #e5e7eb; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 13px; max-height: 400px; overflow-y: auto; margin-top: 8px; }
+    .attr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .attr { font-size: 13px; padding: 4px 8px; background: #f3f4f6; border-radius: 4px; }
+    .attr .key { color: #6b7280; }
+    .attr .val { color: #059669; font-weight: 500; }
+    .status { padding: 8px 12px; border-radius: 8px; font-size: 13px; margin-top: 8px; }
+    .status.ok { background: #d1fae5; color: #065f46; }
+    .status.warn { background: #fef3c7; color: #92400e; }
+    a { color: #2563eb; }
+    #span-log { list-style: none; }
+    #span-log li { padding: 6px 8px; border-bottom: 1px solid #f3f4f6; font-size: 13px; font-family: monospace; }
+    #span-log li:last-child { border-bottom: none; }
+  </style>
+</head>
+<body>
+  <h1>Session Spans Test</h1>
+  <p class="subtitle">Exercises session.sequence, session.timeout_ms, and consent.* attributes. <a href="http://localhost:16686" target="_blank">Open Jaeger UI</a></p>
+
+  <div class="card">
+    <h2>SDK Status</h2>
+    <div id="sdk-status" class="status warn">SDK not initialized</div>
+    <div id="session-attrs" style="margin-top: 12px;"></div>
+  </div>
+
+  <div class="card">
+    <h2>Generate Spans</h2>
+    <p style="font-size: 13px; color: #6b7280; margin-bottom: 8px;">Each action sends a span to Jaeger. Check the attributes in the Jaeger UI.</p>
+    <button class="primary" onclick="simulateNavigation('/about')">Navigate to /about</button>
+    <button class="primary" onclick="simulateNavigation('/pricing')">Navigate to /pricing</button>
+    <button class="primary" onclick="simulateNavigation('/blog/hello-world')">Navigate to /blog/hello-world</button>
+    <button onclick="trackCustomEvent()">Custom Event</button>
+    <button onclick="clearSession()">Clear Session (new session.id)</button>
+  </div>
+
+  <div class="card">
+    <h2>Captured Spans</h2>
+    <ul id="span-log"></ul>
+    <div id="no-spans" style="color: #9ca3af; font-size: 13px;">No spans captured yet. Accept consent and interact with the page.</div>
+  </div>
+
+  <div class="card">
+    <h2>Last Span Attributes</h2>
+    <pre id="last-span">Waiting for first span...</pre>
+  </div>
+
+  <div class="card">
+    <h2>Contact Protocol</h2>
+    <p style="font-size: 13px; color: #6b7280; margin-bottom: 8px;">
+      Tests the Contact Protocol handshake and BroadcastChannel span sharing.
+    </p>
+    <div id="contact-status" class="status warn">No extension detected</div>
+    <button onclick="checkContact()">Check Extension</button>
+    <button onclick="mockExtension()">Mock Extension (Accept)</button>
+    <button onclick="mockExtensionDecline()">Mock Extension (Decline)</button>
+    <div id="contact-log" style="margin-top: 8px; font-size: 12px; font-family: monospace;"></div>
+  </div>
+
+  <script src="opengander-sdk.js"></script>
+  <script>
+    // Intercept sendSpan to capture attributes for display
+    const capturedSpans = [];
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options) {
+      if (typeof url === 'string' && url.includes('/v1/traces') && options && options.body) {
+        try {
+          const payload = JSON.parse(options.body);
+          const spans = payload.resourceSpans?.[0]?.scopeSpans?.[0]?.spans || [];
+          spans.forEach(span => {
+            const attrs = {};
+            (span.attributes || []).forEach(a => {
+              attrs[a.key] = a.value?.stringValue || a.value?.intValue || '';
+            });
+            capturedSpans.push({ name: span.name, traceId: span.traceId?.slice(0, 8), attrs });
+            updateSpanLog();
+            updateLastSpan(attrs);
+          });
+        } catch (e) { /* ignore parse errors */ }
+      }
+      return originalFetch.apply(this, arguments);
+    };
+
+    function updateSpanLog() {
+      const log = document.getElementById('span-log');
+      const noSpans = document.getElementById('no-spans');
+      noSpans.style.display = 'none';
+      log.innerHTML = capturedSpans.map((s, i) =>
+        `<li><strong>#${i + 1}</strong> ${s.name} <span style="color:#6b7280">(trace: ${s.traceId}..., seq: ${s.attrs['session.sequence'] || '?'})</span></li>`
+      ).reverse().join('');
+    }
+
+    function updateLastSpan(attrs) {
+      const sessionKeys = Object.keys(attrs).filter(k =>
+        k.startsWith('session.') || k.startsWith('consent.') || k.startsWith('traffic.')
+      ).sort();
+      const formatted = {};
+      sessionKeys.forEach(k => { formatted[k] = attrs[k]; });
+      document.getElementById('last-span').textContent = JSON.stringify(formatted, null, 2);
+
+      // Update session attrs display
+      const grid = document.getElementById('session-attrs');
+      const highlight = ['session.sequence', 'session.timeout_ms', 'consent.status', 'consent.jurisdiction', 'consent.ring', 'consent.protocol'];
+      grid.innerHTML = '<div class="attr-grid">' + highlight.map(k =>
+        `<div class="attr"><span class="key">${k}:</span> <span class="val">${attrs[k] || 'n/a'}</span></div>`
+      ).join('') + '</div>';
+    }
+
+    function simulateNavigation(path) {
+      history.pushState({}, '', path);
+    }
+
+    function trackCustomEvent() {
+      if (window.otel) {
+        window.otel.trackEvent('test_event', {
+          'test.action': 'button_click',
+          'test.label': 'custom_event_test'
+        });
+      }
+    }
+
+    function clearSession() {
+      // Clear session data to force a new session
+      Object.keys(localStorage).forEach(k => {
+        if (k.startsWith('otel_session')) localStorage.removeItem(k);
+      });
+      location.reload();
+    }
+
+    // Contact Protocol test functions
+    function checkContact() {
+      const el = document.getElementById('contact-status');
+      if (window.__contact && window.__contact.ready) {
+        el.className = 'status ok';
+        el.textContent = 'Extension detected (v' + window.__contact.version + ')';
+        addContactLog('Extension detected');
+      } else {
+        el.className = 'status warn';
+        el.textContent = 'No extension detected';
+        addContactLog('No extension found');
+      }
+    }
+
+    function mockExtension() {
+      window.__contact = { version: 1, ready: true };
+      document.addEventListener('contact:propose', (e) => {
+        addContactLog('Proposal received: ' + JSON.stringify(e.detail));
+        document.dispatchEvent(new CustomEvent('contact:accept', {
+          detail: { participant_id: 'mock-' + Date.now() }
+        }));
+        addContactLog('Accepted');
+      });
+      addContactLog('Mock extension installed (will accept)');
+      checkContact();
+    }
+
+    function mockExtensionDecline() {
+      window.__contact = { version: 1, ready: true };
+      document.addEventListener('contact:propose', (e) => {
+        addContactLog('Proposal received, declining');
+        document.dispatchEvent(new CustomEvent('contact:decline'));
+      });
+      addContactLog('Mock extension installed (will decline)');
+      checkContact();
+    }
+
+    function addContactLog(msg) {
+      const el = document.getElementById('contact-log');
+      el.innerHTML = new Date().toISOString().substr(11, 12) + ' ' + msg + '<br>' + el.innerHTML;
+    }
+
+    // Initialize the SDK pointing at local Jaeger OTLP endpoint
+    initOtelBrowser({
+      serviceName: 'session-spans-test',
+      collectorUrl: 'http://localhost:4318/v1/traces',
+      debug: true,
+      consent: {
+        theme: 'light'
+      }
+    }).then(() => {
+      document.getElementById('sdk-status').className = 'status ok';
+      document.getElementById('sdk-status').textContent = 'SDK initialized — spans flowing to Jaeger';
+    });
+  </script>
+</body>
+</html>
