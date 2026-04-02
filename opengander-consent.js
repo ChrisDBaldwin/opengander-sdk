@@ -43,6 +43,7 @@
   window.__ogConsentLoaded = true;
 
   var CONSENT_STORAGE_KEY = 'og_consent';
+  var _debugEnabled = false;
 
   // ─── Jurisdiction Detection ─────────────────────────────────────────
 
@@ -120,9 +121,8 @@
    * Returns: { level: 'strict'|'standard', jurisdiction: string, signals: object }
    */
   function detectJurisdiction() {
-    // Demo/testing override — allows the demo page to simulate jurisdictions
-    // without modifying private internals. Not for production use.
-    if (window.__ogJurisdictionOverride) {
+    // Testing-only: jurisdiction override requires debug: true in SDK config
+    if (_debugEnabled && window.__ogJurisdictionOverride) {
       return window.__ogJurisdictionOverride;
     }
 
@@ -637,6 +637,7 @@
 
   if (realInit) {
     window.initOtelBrowser = async function(userConfig) {
+    _debugEnabled = !!userConfig.debug;
     var consentConfig = Object.assign({
       theme: 'auto',
       privacyUrl: null,
@@ -796,6 +797,7 @@
      */
     show: function(options) {
       options = options || {};
+      _debugEnabled = !!options.debug;
       var consentConfig = {
         theme: options.theme || 'auto',
         privacyUrl: options.privacyUrl || null,

@@ -1571,7 +1571,8 @@
     ];
 
     function detectJurisdiction() {
-      if (window.__ogJurisdictionOverride) {
+      // Testing-only: jurisdiction override requires debug: true in SDK config
+      if (config.debug && window.__ogJurisdictionOverride) {
         return window.__ogJurisdictionOverride;
       }
 
