@@ -1,12 +1,14 @@
+> **⚠️ This repository has moved.** Development continues in the OpenGander monorepo:
+> [github.com/opengander/opengander](https://github.com/opengander/opengander) (`packages/web-sdk`).
+> This repo is kept as a read-only archive.
+
 # OpenGander Web SDK
 
-Browser-based Real User Monitoring SDK that tracks page views, SPA navigation, Web Vitals, user interactions, errors, and marketing attribution via OpenTelemetry.
+> [OpenGander](https://opengander.com) is privacy-first web analytics built on OpenTelemetry. [Get started free](https://opengander.com).
 
-This is the source code for the script that runs on sites using [OpenGander](https://opengander.io). It's published here so you can read exactly what it does.
+This is the source code for the script that runs on sites using OpenGander. You can read every line, [verify the build matches what's served](SECURITY.md#verifying-the-served-sdk), and [audit the data it collects](PRIVACY.md). The companion [browser extension](https://github.com/ChrisDBaldwin/opengander-extension) gives visitors their own copy of the telemetry. Together, they make the full [Contact Protocol](https://github.com/ChrisDBaldwin/opengander-extension/blob/main/PROTOCOL.md) auditable end to end.
 
-## Why Open Source?
-
-This repo exists for transparency. The SDK runs on your site, in your visitors' browsers — you should be able to read every line of it. This isn't a community project looking for contributors; it's a read-only reference so you can verify what the code does, audit the data it collects, and confirm it matches what's served from our CDN. Fork it if you want. The companion [browser extension](https://github.com/opengander/opengander-extension) is published for the same reason.
+This isn't a community project looking for contributors. It's a read-only reference. Fork it if you want.
 
 ## Quick Start
 
@@ -22,16 +24,20 @@ This repo exists for transparency. The SDK runs on your site, in your visitors' 
 </script>
 ```
 
-One script tag is all you need — consent is bundled.
+One script tag — consent is bundled, no build step required. This sends data to your [OpenGander dashboard](https://opengander.com), where you get real-time page views, Web Vitals, marketing attribution, and error tracking.
 
 ## What Gets Tracked
 
-- **Page views** — every page load and SPA navigation
-- **Web Vitals** — LCP, FID, CLS, TTFB, INP
-- **Navigation timing** — DNS, TCP, request, response, DOM processing
-- **User interactions** — clicks and form submissions
-- **Errors** — JavaScript errors and unhandled promise rejections
-- **Marketing attribution** — UTM parameters, referrer, traffic source classification
+| Category | Details |
+|----------|---------|
+| Page views | Every page load and SPA navigation |
+| Web Vitals | LCP, FID, CLS, TTFB, INP |
+| Navigation timing | DNS, TCP, request, response, DOM processing |
+| User interactions | Clicks and form submissions |
+| Errors | JavaScript errors and unhandled promise rejections |
+| Marketing attribution | UTM parameters, referrer, traffic source classification |
+
+See [PRIVACY.md](PRIVACY.md) for the full data dictionary, what's redacted, and what's never collected.
 
 ## Configuration
 
@@ -48,42 +54,38 @@ initOtelBrowser({
   captureErrors: true,
   requireToken: false,
   maxQueueSize: 100,
-  sessionTimeout: 1800,   // 30 min default
+  sessionTimeout: 1800,
   customAttributes: {}
 });
 ```
 
 ## Consent
 
-Consent is built into the SDK — best-effort, default-on. It is enabled by default and designed to be kept on. The consent module detects the visitor's jurisdiction and shows the appropriate UI:
+Consent is built in and designed to stay on. The module detects the visitor's jurisdiction and shows the appropriate UI:
 
-- **STRICT** jurisdictions (EU/EEA, UK, Brazil, Japan, South Korea, India, etc.) — full-page gate. No tracking until the visitor explicitly consents.
-- **STANDARD** jurisdictions (US, Canada, Australia, etc.) — bottom banner. Non-intrusive but still requires an explicit accept or decline.
+- **STRICT** (EU/EEA, UK, Brazil, Japan, South Korea, India, etc.) — full-page gate. No tracking until the visitor explicitly consents.
+- **STANDARD** (US, Canada, Australia, etc.) — bottom banner. Still requires an explicit accept or decline.
 - **Do Not Track** — honored globally. The SDK never initializes.
 
-Jurisdiction detection uses `Intl.DateTimeFormat().resolvedOptions().timeZone` (primary) and `navigator.language` (secondary). Defaults to STRICT if detection fails (fail-safe).
+Detection uses `Intl.DateTimeFormat().resolvedOptions().timeZone` with `navigator.language` as a fallback. Defaults to STRICT if detection fails.
 
-**Important:** Timezone-based jurisdiction detection is a heuristic, not a legal guarantee. VPNs, international travel, and timezone spoofing can cause misclassification. The SDK provides privacy tooling as a strong default, but site operators remain responsible for their own GDPR/CCPA compliance. If your site has specific regulatory requirements, use the programmatic API above to integrate with your own consent management platform.
+> **Note:** Timezone detection is a heuristic — VPNs and travel can cause misclassification. The SDK provides strong privacy defaults, but site operators remain responsible for their own GDPR/CCPA compliance.
 
-### Consent Configuration
+### Consent Options
 
 ```javascript
-initOtelBrowser({
-  serviceName: 'my-site',
-  collectorUrl: '...',
-  consent: {
-    privacyUrl: '/privacy',   // Link to privacy policy (recommended)
-    theme: 'auto',            // 'light' | 'dark' | 'auto' (default: 'auto')
-    expiry: 365,              // Days to remember consent (default: 365)
-    onConsent: (granted, jurisdiction) => { ... },
-    text: {                   // Custom copy (optional)
-      heading: null,
-      body: null,
-      accept: null,
-      decline: null
-    }
+consent: {
+  privacyUrl: '/privacy',       // Privacy policy link (recommended; required for GDPR)
+  theme: 'auto',                // 'light' | 'dark' | 'auto'
+  expiry: 365,                  // Days to remember consent
+  onConsent: (granted, jurisdiction) => { ... },
+  text: {                       // Custom copy (optional)
+    heading: null,
+    body: null,
+    accept: null,
+    decline: null
   }
-});
+}
 ```
 
 ### Programmatic API
@@ -101,7 +103,7 @@ OpenGanderConsent.reset();            // Re-prompt on next page load
 OpenGanderConsent.show(options);      // Show consent UI standalone
 ```
 
-## Custom Event Tracking
+## Custom Events
 
 ```javascript
 window.otel.trackEvent('button.clicked', { 'button.id': 'signup' });
@@ -110,24 +112,26 @@ window.otel.setAttributes({ 'user.id': '12345' });
 
 ## How It Works
 
-The SDK initializes asynchronously and fetches a short-lived JWT (5-min TTL) from OpenGander's token service before sending telemetry. Events triggered before initialization completes are automatically queued. Use `await initOtelBrowser()` if you need to guarantee readiness, or `window.waitForOtel(timeout)` for a timeout-based check.
+The SDK fetches a short-lived JWT (5-min TTL, bound to origin + IP) from OpenGander's token service, then sends telemetry spans to the configured OTEL collector. Events triggered before initialization are automatically queued.
 
-Privacy is built in: the SDK redacts sensitive URL parameters (token, password, key, secret), strips authorization and cookie headers, and limits text content to 100 characters.
+```javascript
+await initOtelBrowser({ ... });  // Wait for readiness
+// or
+window.waitForOtel(5000);        // Timeout-based check
+```
 
-## Design Decisions
-
-- **Vanilla JavaScript, no build step.** Single `.js` file that works anywhere — Ghost blogs, static HTML, SPAs. No TypeScript, no bundler, no npm install. There's no `package.json` because there's nothing to install — just a `<script>` tag.
-- **Token-based auth over API keys.** Short-lived JWTs bound to origin + IP replace static API keys that anyone could copy.
-- **Ghost inline variant.** `ghost-inline.html` bundles everything into a single paste-able `<script>` block for Ghost's code injection.
+Sensitive URL parameters are redacted, authorization and cookie headers are stripped, and text content is truncated to 100 characters. See [SECURITY.md](SECURITY.md) for the full list.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `opengander-sdk.js` | Main SDK with bundled consent |
-| `opengander-consent.js` | Standalone consent module (bundled into the SDK — provided for reference) |
+| `opengander-consent.js` | Standalone consent module (bundled into SDK — for reference) |
 | `ghost-inline.html` | Self-contained version for Ghost blogs |
-| `test/*.html` | Local test pages for development |
+| `test/*.html` | Local test pages |
+| [SECURITY.md](SECURITY.md) | Auditor's guide — data flow, redactions, verification |
+| [PRIVACY.md](PRIVACY.md) | Data collection and privacy documentation |
 
 ## License
 
